@@ -31,16 +31,39 @@ async function main() {
     console.error(`File not found: ${abs}`);
     process.exit(1);
   }
-  if (!process.env.DATABASE_URL) {
-    console.error('DATABASE_URL is not set. Make sure your .env is in place.');
+  const sql = fs.readFileSync(abs, 'utf8');
+
+  // Build connection options. We explicitly parse DATABASE_URL ourselves
+  // instead of handing it to mysql2 as `uri`, because some mysql2 builds
+  // silently fall back to 'root'@'localhost' when the `uri` option is
+  // empty or slightly malformed (e.g. missing port, encoded @ in password).
+  // Falling back to individual DB_* vars lets this script work in setups
+  // that don't use a single URL.
+  const connOpts = { multipleStatements: true };
+  if (process.env.DATABASE_URL) {
+    const u = new URL(process.env.DATABASE_URL);
+    connOpts.host = u.hostname;
+    connOpts.port = u.port ? Number(u.port) : 3306;
+    connOpts.user = decodeURIComponent(u.username || '');
+    connOpts.password = decodeURIComponent(u.password || '');
+    connOpts.database = u.pathname.replace(/^\//, '') || undefined;
+  } else if (process.env.DB_HOST) {
+    connOpts.host = process.env.DB_HOST;
+    connOpts.port = Number(process.env.DB_PORT || 3306);
+    connOpts.user = process.env.DB_USER;
+    connOpts.password = process.env.DB_PASSWORD;
+    connOpts.database = process.env.DB_NAME;
+  } else {
+    console.error(
+      'Neither DATABASE_URL nor DB_HOST is set. Make sure your .env is loaded.',
+    );
     process.exit(1);
   }
 
-  const sql = fs.readFileSync(abs, 'utf8');
-  const conn = await mysql.createConnection({
-    uri: process.env.DATABASE_URL,
-    multipleStatements: true,
-  });
+  console.log(
+    `→ Connecting to mysql://${connOpts.user}@${connOpts.host}:${connOpts.port}/${connOpts.database}`,
+  );
+  const conn = await mysql.createConnection(connOpts);
 
   console.log(`→ Running ${path.basename(file)} …`);
   try {

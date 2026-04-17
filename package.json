@@ -9,6 +9,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
+    "db:run": "node scripts/run-sql.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

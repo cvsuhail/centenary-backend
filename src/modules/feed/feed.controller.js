@@ -36,17 +36,25 @@ const invalidateFeedCaches = async () => {
 
 // Computes the max posts.updatedAt across the requested scope so clients can
 // use it as the next `since` cursor and so we can reply with 'not modified'
-// when nothing is newer.
+// when nothing is newer. We build the query in two branches because drizzle
+// does not accept `undefined` as a `.where()` argument.
 const maxFeedUpdatedAt = async (delegate) => {
-  const [row] = await db
-    .select({ value: max(posts.updatedAt) })
-    .from(posts)
-    .where(
-      delegate
-        ? or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
-        : undefined,
-    );
-  return row?.value || null;
+  try {
+    const base = db.select({ value: max(posts.updatedAt) }).from(posts);
+    const query = delegate
+      ? base.where(
+          or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL')),
+        )
+      : base;
+    const [row] = await query;
+    return row?.value || null;
+  } catch (err) {
+    // A failure here should never take down the whole feed response — the
+    // worst that happens is we skip the notModified short-circuit and
+    // return data normally.
+    console.error('[Feed][maxFeedUpdatedAt] Error:', err);
+    return null;
+  }
 };
 
 const parseSince = (raw) => {

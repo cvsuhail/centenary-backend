@@ -1,4 +1,4 @@
-const { eq, and, sql, inArray, or } = require('drizzle-orm');
+const { eq, and, sql, inArray, or, gt, max } = require('drizzle-orm');
 const db = require('../../common/db');
 const { posts, postMedia, postStats, reactions } = require('../../common/schema');
 const redis = require('../../common/redis');
@@ -16,11 +16,43 @@ const REACTION_TO_FIELD = {
 
 const DELEGATIONS = ['all', 'SSF', 'SYS', 'SKSSF', 'KMJ', 'RSC'];
 
+// Bumps `posts.updatedAt` so the client-side lastSyncedAt / If-Modified-Since
+// flow knows the row has new counters to pull. We use NOW() to avoid clock
+// skew between the app server and whatever DB node we're talking to.
+const bumpPostUpdatedAt = async (postId, txOrDb = db) => {
+  if (!postId) return;
+  await txOrDb
+    .update(posts)
+    .set({ updatedAt: sql`NOW()` })
+    .where(eq(posts.id, postId));
+};
+
 const invalidateFeedCaches = async () => {
   await Promise.all(
     DELEGATIONS.map((d) => redis.del(`feed:delegation:${d}`))
   );
   await redis.set('sync:lastUpdated', new Date().toISOString());
+};
+
+// Computes the max posts.updatedAt across the requested scope so clients can
+// use it as the next `since` cursor and so we can reply with 'not modified'
+// when nothing is newer.
+const maxFeedUpdatedAt = async (delegate) => {
+  const [row] = await db
+    .select({ value: max(posts.updatedAt) })
+    .from(posts)
+    .where(
+      delegate
+        ? or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
+        : undefined,
+    );
+  return row?.value || null;
+};
+
+const parseSince = (raw) => {
+  if (!raw) return null;
+  const dt = new Date(raw);
+  return Number.isNaN(dt.getTime()) ? null : dt;
 };
 
 // Merge the authenticated user's own reactions (if any) onto a list of posts
@@ -36,10 +68,32 @@ const attachMyReactions = async (feedPosts, userId) => {
   return feedPosts.map((p) => ({ ...p, myReaction: byPost.get(p.id) || null }));
 };
 
+// Response envelope for the feed. Always carries a `lastUpdated` so the
+// mobile app can stash it in Hive and send it back on the next request to
+// avoid re-downloading unchanged data.
+const buildFeedEnvelope = (items, lastUpdated, notModified = false) => ({
+  items,
+  lastUpdated: lastUpdated ? new Date(lastUpdated).toISOString() : null,
+  notModified,
+});
+
 const getFeed = async (req, res) => {
   const { delegate } = req.query;
+  const since = parseSince(req.query.since);
   const userId = req.user ? req.user.id : null;
   const cacheKey = `feed:delegation:${delegate || 'all'}`;
+
+  // Short-circuit: if the caller already has data at-or-after the max
+  // updatedAt in scope, don't touch the DB query at all. This is the hot
+  // path for idle mobile clients checking in.
+  const lastUpdatedAt = await maxFeedUpdatedAt(delegate);
+  if (since && lastUpdatedAt && since >= lastUpdatedAt) {
+    return success(
+      res,
+      buildFeedEnvelope([], lastUpdatedAt, true),
+      'Feed not modified',
+    );
+  }
 
   // Serve the shared cache only for unauthenticated requests. When a user
   // is present we need to stitch in their own `myReaction` values, so
@@ -47,7 +101,12 @@ const getFeed = async (req, res) => {
   if (!userId) {
     const cached = await redis.get(cacheKey);
     if (cached) {
-      return success(res, JSON.parse(cached), 'Feed fetched from cache');
+      const parsed = JSON.parse(cached);
+      return success(
+        res,
+        buildFeedEnvelope(parsed, lastUpdatedAt, false),
+        'Feed fetched from cache',
+      );
     }
   }
 
@@ -61,11 +120,19 @@ const getFeed = async (req, res) => {
 
   if (!userId) {
     await redis.set(cacheKey, JSON.stringify(feedPosts), 'EX', 60);
-    return success(res, feedPosts, 'Feed fetched from database');
+    return success(
+      res,
+      buildFeedEnvelope(feedPosts, lastUpdatedAt, false),
+      'Feed fetched from database',
+    );
   }
 
   const personalized = await attachMyReactions(feedPosts, userId);
-  return success(res, personalized, 'Feed fetched from database');
+  return success(
+    res,
+    buildFeedEnvelope(personalized, lastUpdatedAt, false),
+    'Feed fetched from database',
+  );
 };
 
 const getPostById = async (req, res) => {
@@ -194,6 +261,7 @@ const reactToPost = async (req, res) => {
         updates[prevField] = sql`GREATEST(${prevColumn} - 1, 0)`;
       }
       await tx.update(postStats).set(updates).where(eq(postStats.postId, postId));
+      await bumpPostUpdatedAt(postId, tx);
     });
 
     await invalidateFeedCaches();
@@ -214,6 +282,7 @@ const viewPost = async (req, res) => {
     await db.update(postStats)
       .set({ viewsCount: sql`${postStats.viewsCount} + 1` })
       .where(eq(postStats.postId, postId));
+    await bumpPostUpdatedAt(postId);
     await invalidateFeedCaches();
   }
 
@@ -228,8 +297,74 @@ const sharePost = async (req, res) => {
     .set({ shareCount: sql`${postStats.shareCount} + 1` })
     .where(eq(postStats.postId, postId));
 
+  await bumpPostUpdatedAt(postId);
   await invalidateFeedCaches();
   return success(res, null, 'Share recorded');
+};
+
+// Updates the editable fields of a post and (optionally) its media list.
+// When `media` is provided we replace the entire set — this keeps the admin
+// UI simple (edit means "here is the new state") at the cost of one delete
+// + insert per save. Counters in post_stats are never touched here.
+const updatePost = async (req, res) => {
+  const { postId } = req.params;
+  const {
+    title,
+    description,
+    mediaType,
+    mediaLayout,
+    authorName,
+    authorDp,
+    delegation,
+    isImportant,
+    media,
+  } = req.body;
+
+  if (!postId) return error(res, 'postId is required', 400);
+
+  try {
+    const [existing] = await db.select().from(posts).where(eq(posts.id, postId));
+    if (!existing) return error(res, 'Post not found', 404);
+
+    const updates = { updatedAt: sql`NOW()` };
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (mediaType !== undefined) updates.mediaType = mediaType;
+    if (mediaLayout !== undefined) updates.mediaLayout = mediaLayout;
+    if (authorName !== undefined) updates.authorName = authorName;
+    if (authorDp !== undefined) updates.authorDp = authorDp;
+    if (delegation !== undefined) updates.delegation = delegation;
+    if (isImportant !== undefined) updates.isImportant = Boolean(isImportant);
+
+    await db.transaction(async (tx) => {
+      await tx.update(posts).set(updates).where(eq(posts.id, postId));
+
+      if (Array.isArray(media)) {
+        await tx.delete(postMedia).where(eq(postMedia.postId, postId));
+        if (media.length > 0) {
+          await tx.insert(postMedia).values(
+            media.map((m, index) => ({
+              postId: Number(postId),
+              url: m.url,
+              type: m.type,
+              orderIndex: index,
+            })),
+          );
+        }
+      }
+    });
+
+    await invalidateFeedCaches();
+
+    const fresh = await db.query.posts.findFirst({
+      where: eq(posts.id, postId),
+      with: { media: true, stats: true },
+    });
+    return success(res, fresh, 'Post updated successfully');
+  } catch (err) {
+    console.error('[Feed][update-post] Error:', err);
+    return error(res, 'Failed to update post', 500, err.message);
+  }
 };
 
 const deletePost = async (req, res) => {
@@ -284,6 +419,7 @@ module.exports = {
   getFeed,
   getPostById,
   createPost,
+  updatePost,
   reactToPost,
   viewPost,
   sharePost,

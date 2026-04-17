@@ -10,6 +10,7 @@ router.get('/', optionalAuth, feedController.getFeed);
 router.get('/stats', authMiddleware, feedController.getStats);
 router.get('/:postId', optionalAuth, feedController.getPostById);
 router.post('/create', authMiddleware, feedController.createPost);
+router.put('/:postId', authMiddleware, feedController.updatePost);
 router.post('/react', authMiddleware, feedController.reactToPost);
 router.post('/view', authMiddleware, feedController.viewPost);
 router.post('/share', authMiddleware, feedController.sharePost);

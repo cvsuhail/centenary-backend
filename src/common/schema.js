@@ -54,11 +54,17 @@ const postMediaRelations = relations(postMedia, ({ one }) => ({
 }));
 
 // ─── POST STATS ─────────────────────────────────────────────────────────────
+// reactionsCount is the aggregate across all reaction types; the per-type
+// counts (likeCount, supportCount, appreciateCount) are stored alongside so
+// the clients can render each emoji's count without a join.
 const postStats = mysqlTable('post_stats', {
-  postId:         int('post_id').primaryKey(),
-  viewsCount:     int('views_count').notNull().default(0),
-  reactionsCount: int('reactions_count').notNull().default(0),
-  shareCount:     int('share_count').notNull().default(0),
+  postId:          int('post_id').primaryKey(),
+  viewsCount:      int('views_count').notNull().default(0),
+  reactionsCount:  int('reactions_count').notNull().default(0),
+  likeCount:       int('like_count').notNull().default(0),
+  supportCount:    int('support_count').notNull().default(0),
+  appreciateCount: int('appreciate_count').notNull().default(0),
+  shareCount:      int('share_count').notNull().default(0),
 });
 
 const postStatsRelations = relations(postStats, ({ one }) => ({

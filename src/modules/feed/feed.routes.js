@@ -3,8 +3,12 @@ const router = express.Router();
 const feedController = require('./feed.controller');
 const authMiddleware = require('../../middlewares/auth.middleware');
 
-router.get('/', feedController.getFeed);
+const { optionalAuth } = authMiddleware;
+
+// Public but personalizes the `myReaction` field when a token is supplied.
+router.get('/', optionalAuth, feedController.getFeed);
 router.get('/stats', authMiddleware, feedController.getStats);
+router.get('/:postId', optionalAuth, feedController.getPostById);
 router.post('/create', authMiddleware, feedController.createPost);
 router.post('/react', authMiddleware, feedController.reactToPost);
 router.post('/view', authMiddleware, feedController.viewPost);

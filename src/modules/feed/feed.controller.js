@@ -1,6 +1,14 @@
 const { eq, and, sql, inArray, or, gt, max } = require('drizzle-orm');
 const db = require('../../common/db');
-const { posts, postMedia, postStats, reactions, postViews } = require('../../common/schema');
+const {
+  posts,
+  postMedia,
+  postStats,
+  reactions,
+  postViews,
+  guestReactions,
+  guestViews,
+} = require('../../common/schema');
 const redis = require('../../common/redis');
 const { success, error } = require('../../common/response');
 
@@ -60,15 +68,31 @@ const parseSince = (raw) => {
   return Number.isNaN(dt.getTime()) ? null : dt;
 };
 
-// Merge the authenticated user's own reactions (if any) onto a list of posts
-// so the client can highlight the active reaction without a separate request.
-const attachMyReactions = async (feedPosts, userId) => {
-  if (!userId || feedPosts.length === 0) return feedPosts;
+// Merge the caller's own reactions (if any) onto a list of posts so the
+// client can highlight the active reaction without a second request.
+// `identity` is one of:
+//   { userId: <int> }   — authenticated volunteer/admin
+//   { guestId: <uuid> } — guest client with a stable X-Guest-Id header
+//   null                — fully anonymous, no personalization
+const attachMyReactions = async (feedPosts, identity) => {
+  if (!identity || feedPosts.length === 0) return feedPosts;
   const ids = feedPosts.map((p) => p.id);
-  const rows = await db
-    .select({ postId: reactions.postId, type: reactions.type })
-    .from(reactions)
-    .where(and(eq(reactions.userId, userId), inArray(reactions.postId, ids)));
+
+  let rows;
+  if (identity.userId) {
+    rows = await db
+      .select({ postId: reactions.postId, type: reactions.type })
+      .from(reactions)
+      .where(and(eq(reactions.userId, identity.userId), inArray(reactions.postId, ids)));
+  } else if (identity.guestId) {
+    rows = await db
+      .select({ postId: guestReactions.postId, type: guestReactions.type })
+      .from(guestReactions)
+      .where(and(eq(guestReactions.guestId, identity.guestId), inArray(guestReactions.postId, ids)));
+  } else {
+    return feedPosts;
+  }
+
   const byPost = new Map(rows.map((r) => [r.postId, r.type]));
   return feedPosts.map((p) => ({ ...p, myReaction: byPost.get(p.id) || null }));
 };
@@ -76,15 +100,36 @@ const attachMyReactions = async (feedPosts, userId) => {
 // Mirror of attachMyReactions for the persisted views set. Lets the mobile
 // app sort unviewed posts to the top on first render without having to
 // reconcile a local-only set against the server.
-const attachMyViews = async (feedPosts, userId) => {
-  if (!userId || feedPosts.length === 0) return feedPosts;
+const attachMyViews = async (feedPosts, identity) => {
+  if (!identity || feedPosts.length === 0) return feedPosts;
   const ids = feedPosts.map((p) => p.id);
-  const rows = await db
-    .select({ postId: postViews.postId })
-    .from(postViews)
-    .where(and(eq(postViews.userId, userId), inArray(postViews.postId, ids)));
+
+  let rows;
+  if (identity.userId) {
+    rows = await db
+      .select({ postId: postViews.postId })
+      .from(postViews)
+      .where(and(eq(postViews.userId, identity.userId), inArray(postViews.postId, ids)));
+  } else if (identity.guestId) {
+    rows = await db
+      .select({ postId: guestViews.postId })
+      .from(guestViews)
+      .where(and(eq(guestViews.guestId, identity.guestId), inArray(guestViews.postId, ids)));
+  } else {
+    return feedPosts;
+  }
+
   const seen = new Set(rows.map((r) => r.postId));
   return feedPosts.map((p) => ({ ...p, viewedByMe: seen.has(p.id) }));
+};
+
+// Returns `{ userId, guestId }` shaped for the attach* helpers. Prefers
+// userId over guestId — an authenticated user shadowing a guest id in
+// the same request should see their user-scoped reactions.
+const identityFor = (req) => {
+  if (req.user && req.user.id) return { userId: req.user.id };
+  if (req.guestId) return { guestId: req.guestId };
+  return null;
 };
 
 // Response envelope for the feed. Always carries a `lastUpdated` so the
@@ -142,8 +187,9 @@ const getFeed = async (req, res) => {
     orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
   });
 
-  const withReactions = await attachMyReactions(feedPosts, userId);
-  const personalized = await attachMyViews(withReactions, userId);
+  const identity = identityFor(req);
+  const withReactions = await attachMyReactions(feedPosts, identity);
+  const personalized = await attachMyViews(withReactions, identity);
   return success(
     res,
     buildFeedEnvelope(personalized, lastUpdatedAt, false),
@@ -155,15 +201,33 @@ const getFeed = async (req, res) => {
 // important first so admins who also toggle `isImportant` get the usual
 // "pinned at top" behaviour. No auth required — this is the first thing a
 // guest user sees on app open.
+//
+// Response shape: `{ items, totalCount, lastUpdated }`. `totalCount` lets
+// the mobile app decide client-side whether to hide the Feed tab (guest
+// with ≤3 home-feed posts) or render an overflow list in the Feed tab
+// (guest with 4+ home-feed posts). Volunteers ignore the count.
+//
+// Cache: the anonymous-only response is cached in Redis for 60s, keyed
+// by `feed:home`. Any reaction / view / share / create / update / delete
+// bust the cache via `invalidateFeedCaches()`.
 const getHomeFeed = async (req, res) => {
-  const userId = req.user ? req.user.id : null;
+  const identity = identityFor(req);
+  const isAnon = !identity;
   const cacheKey = 'feed:home';
 
-  if (!userId) {
+  if (isAnon) {
     const cached = await redis.get(cacheKey);
     if (cached) {
       const parsed = JSON.parse(cached);
-      return success(res, { items: parsed }, 'Home feed fetched from cache');
+      return success(
+        res,
+        {
+          items: parsed,
+          totalCount: parsed.length,
+          lastUpdated: await redis.get('sync:lastUpdated'),
+        },
+        'Home feed fetched from cache',
+      );
     }
   }
 
@@ -173,14 +237,27 @@ const getHomeFeed = async (req, res) => {
     orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
   });
 
-  if (!userId) {
+  const lastUpdated = await redis.get('sync:lastUpdated');
+
+  if (isAnon) {
+    // Cache the un-personalised payload only — guests and volunteers
+    // share the base list, but personalised fields (`myReaction`,
+    // `viewedByMe`) are layered on below per request.
     await redis.set(cacheKey, JSON.stringify(feedPosts), 'EX', 60);
-    return success(res, { items: feedPosts }, 'Home feed fetched');
+    return success(
+      res,
+      { items: feedPosts, totalCount: feedPosts.length, lastUpdated },
+      'Home feed fetched',
+    );
   }
 
-  const withReactions = await attachMyReactions(feedPosts, userId);
-  const personalized = await attachMyViews(withReactions, userId);
-  return success(res, { items: personalized }, 'Home feed fetched');
+  const withReactions = await attachMyReactions(feedPosts, identity);
+  const personalized = await attachMyViews(withReactions, identity);
+  return success(
+    res,
+    { items: personalized, totalCount: personalized.length, lastUpdated },
+    'Home feed fetched',
+  );
 };
 
 // Returns the pinned / important posts — sorted newest-first — so the
@@ -189,7 +266,7 @@ const getHomeFeed = async (req, res) => {
 // we don't over-fetch on slow networks.
 const getImportantFeed = async (req, res) => {
   const { delegate } = req.query;
-  const userId = req.user ? req.user.id : null;
+  const identity = identityFor(req);
   const rawLimit = parseInt(req.query.limit, 10);
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 && rawLimit <= 50 ? rawLimit : 10;
 
@@ -205,14 +282,18 @@ const getImportantFeed = async (req, res) => {
     limit,
   });
 
-  const withReactions = await attachMyReactions(feedPosts, userId);
-  const items = await attachMyViews(withReactions, userId);
-  return success(res, { items }, 'Important feed fetched successfully');
+  const withReactions = await attachMyReactions(feedPosts, identity);
+  const items = await attachMyViews(withReactions, identity);
+  return success(
+    res,
+    { items, totalCount: items.length },
+    'Important feed fetched successfully',
+  );
 };
 
 const getPostById = async (req, res) => {
   const { postId } = req.params;
-  const userId = req.user ? req.user.id : null;
+  const identity = identityFor(req);
 
   const post = await db.query.posts.findFirst({
     where: eq(posts.id, postId),
@@ -221,8 +302,8 @@ const getPostById = async (req, res) => {
 
   if (!post) return error(res, 'Post not found', 404);
 
-  const [withReactions] = await attachMyReactions([post], userId);
-  const [personalized] = await attachMyViews([withReactions], userId);
+  const [withReactions] = await attachMyReactions([post], identity);
+  const [personalized] = await attachMyViews([withReactions], identity);
   return success(res, personalized, 'Post fetched successfully');
 };
 
@@ -299,19 +380,34 @@ const createPost = async (req, res) => {
   }
 };
 
-// reactToPost implements the "only one reaction per user per post" rule:
-//  • no existing reaction   → insert + bump total + bump per-type counter.
-//  • same type as before    → delete + decrement total + decrement per-type.
-//  • different type         → update the row in place, decrement old per-type,
-//                              increment new per-type (total unchanged).
+// reactToPost implements the "only one reaction per caller per post" rule.
+// A caller is either an authenticated user OR a guest with a stable
+// X-Guest-Id header. The two identities have their own tables
+// (`reactions` vs `guest_reactions`) but drive the same post_stats
+// counters, so the visible totals stay consistent regardless of who's
+// tapping.
+//
+//   • no existing reaction for this caller → insert + bump total + bump per-type.
+//   • same type as before                  → delete + decrement total + per-type.
+//   • different type                       → swap in place; total unchanged.
 const reactToPost = async (req, res) => {
   const { postId, type } = req.body;
-  const userId = req.user.id;
+  const identity = identityFor(req);
 
+  if (!identity) return error(res, 'Authentication or X-Guest-Id header required', 401);
   if (!postId) return error(res, 'postId is required', 400);
   if (!REACTION_TYPES.includes(type)) {
     return error(res, `type must be one of ${REACTION_TYPES.join(', ')}`, 400);
   }
+
+  const isGuest = !identity.userId;
+  const table = isGuest ? guestReactions : reactions;
+  const whereMatch = isGuest
+    ? and(eq(guestReactions.postId, postId), eq(guestReactions.guestId, identity.guestId))
+    : and(eq(reactions.postId, postId), eq(reactions.userId, identity.userId));
+  const newRow = isGuest
+    ? { postId, guestId: identity.guestId, type }
+    : { postId, userId: identity.userId, type };
 
   try {
     const nextField = REACTION_TO_FIELD[type];
@@ -319,40 +415,39 @@ const reactToPost = async (req, res) => {
     let activeReaction = type;
 
     await db.transaction(async (tx) => {
-      const [existing] = await tx
-        .select()
-        .from(reactions)
-        .where(and(eq(reactions.postId, postId), eq(reactions.userId, userId)));
+      const [existing] = await tx.select().from(table).where(whereMatch);
 
       if (!existing) {
-        await tx.insert(reactions).values({ postId, userId, type });
+        await tx.insert(table).values(newRow);
         await tx.update(postStats)
           .set({
             reactionsCount: sql`${postStats.reactionsCount} + 1`,
             [nextField]: sql`${nextColumn} + 1`,
           })
           .where(eq(postStats.postId, postId));
+        await bumpPostUpdatedAt(postId, tx);
         return;
       }
 
       if (existing.type === type) {
-        // Toggling off — remove the row and undo the counters.
-        await tx.delete(reactions).where(eq(reactions.id, existing.id));
+        // Toggling off — remove the row and undo the counters. Guest
+        // rows don't have an auto-increment id, so we re-match on the
+        // composite key instead.
+        await tx.delete(table).where(whereMatch);
         await tx.update(postStats)
           .set({
             reactionsCount: sql`GREATEST(${postStats.reactionsCount} - 1, 0)`,
             [nextField]: sql`GREATEST(${nextColumn} - 1, 0)`,
           })
           .where(eq(postStats.postId, postId));
+        await bumpPostUpdatedAt(postId, tx);
         activeReaction = null;
         return;
       }
 
       // Switching from one reaction to another — total stays the same.
       const prevField = REACTION_TO_FIELD[existing.type];
-      await tx.update(reactions)
-        .set({ type })
-        .where(eq(reactions.id, existing.id));
+      await tx.update(table).set({ type }).where(whereMatch);
 
       const updates = { [nextField]: sql`${nextColumn} + 1` };
       if (prevField) {
@@ -376,10 +471,13 @@ const reactToPost = async (req, res) => {
 // the same post past the view trigger twice in quick succession.
 const viewPost = async (req, res) => {
   const { postId } = req.body;
-  const userId = req.user.id;
+  const identity = identityFor(req);
+  if (!identity) return error(res, 'Authentication or X-Guest-Id header required', 401);
   if (!postId) return error(res, 'postId is required', 400);
 
-  const viewKey = `view:${postId}:${userId}`;
+  const isGuest = !identity.userId;
+  const actorKey = isGuest ? `g:${identity.guestId}` : String(identity.userId);
+  const viewKey = `view:${postId}:${actorKey}`;
   const cached = await redis.get(viewKey);
   if (cached) return success(res, null, 'View already recorded');
 
@@ -389,15 +487,24 @@ const viewPost = async (req, res) => {
 
   let inserted = false;
   try {
-    const [result] = await db.insert(postViews).values({
-      postId: Number(postId),
-      userId: Number(userId),
-      viewedAt: new Date(),
-    }).onDuplicateKeyUpdate({ set: { userId: Number(userId) } });
-    // `affectedRows` is 1 for a real insert and 2 for a row that was
-    // updated via ON DUPLICATE KEY; anything other than 1 means the row
-    // already existed (MySQL quirk) so we don't double-count.
-    inserted = result && result.affectedRows === 1;
+    if (isGuest) {
+      const [result] = await db.insert(guestViews).values({
+        postId: Number(postId),
+        guestId: identity.guestId,
+        viewedAt: new Date(),
+      }).onDuplicateKeyUpdate({ set: { guestId: identity.guestId } });
+      inserted = result && result.affectedRows === 1;
+    } else {
+      const [result] = await db.insert(postViews).values({
+        postId: Number(postId),
+        userId: Number(identity.userId),
+        viewedAt: new Date(),
+      }).onDuplicateKeyUpdate({ set: { userId: Number(identity.userId) } });
+      // `affectedRows` is 1 for a real insert and 2 for a row that was
+      // updated via ON DUPLICATE KEY; anything other than 1 means the row
+      // already existed (MySQL quirk) so we don't double-count.
+      inserted = result && result.affectedRows === 1;
+    }
   } catch (err) {
     console.error('[Feed][view-post] Failed to record view', err);
   }
@@ -520,6 +627,33 @@ const deletePost = async (req, res) => {
   }
 };
 
+// Cheap "has anything changed since X?" probe for the mobile app's
+// 5-minute foreground poll. Returns the `sync:lastUpdated` ISO string
+// (refreshed by the cron and by every mutating endpoint). Clients pass
+// their own `?since=<iso>` — if it's at-or-after the server value we
+// short-circuit with `changed: false` so Hive doesn't get touched.
+//
+// Intentionally does not return any post data — just the probe. The
+// mobile app then decides whether to hit /feed/home / /feed / /feed/important.
+const getFeedSync = async (req, res) => {
+  const since = parseSince(req.query.since);
+  const cachedRaw = await redis.get('sync:lastUpdated');
+  let lastUpdated = cachedRaw ? new Date(cachedRaw) : null;
+
+  if (!lastUpdated) {
+    // Redis was flushed or the key was never written yet. Fall back to
+    // MySQL max(updatedAt) so the probe still works; the next mutate
+    // will repopulate Redis.
+    lastUpdated = await maxFeedUpdatedAt();
+  }
+
+  const changed = !since || !lastUpdated || since < lastUpdated;
+  return success(res, {
+    changed,
+    lastUpdated: lastUpdated ? new Date(lastUpdated).toISOString() : null,
+  }, changed ? 'Feed has new data' : 'Feed is up to date');
+};
+
 const getStats = async (req, res) => {
   try {
     const [stats] = await db.select({
@@ -548,6 +682,7 @@ module.exports = {
   getFeed,
   getHomeFeed,
   getImportantFeed,
+  getFeedSync,
   getPostById,
   createPost,
   updatePost,

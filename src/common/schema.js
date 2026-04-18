@@ -106,6 +106,39 @@ const reactionsRelations = relations(reactions, ({ one }) => ({
   user: one(users, { fields: [reactions.userId], references: [users.id] }),
 }));
 
+// ─── GUEST REACTIONS ────────────────────────────────────────────────────────
+// Mirrors `reactions` but keyed by a client-generated UUID (`X-Guest-Id`)
+// instead of an internal users.id. Kept in a separate table so a later
+// volunteer account doesn't inherit a guest's taps — the counters on
+// post_stats already reflect both tables' contributions.
+const guestReactions = mysqlTable('guest_reactions', {
+  postId:    int('post_id').notNull(),
+  guestId:   varchar('guest_id', { length: 64 }).notNull(),
+  type:      varchar('type', { length: 50 }).notNull(),
+  createdAt: datetime('created_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.postId, table.guestId] }),
+}));
+
+const guestReactionsRelations = relations(guestReactions, ({ one }) => ({
+  post: one(posts, { fields: [guestReactions.postId], references: [posts.id] }),
+}));
+
+// ─── GUEST VIEWS ────────────────────────────────────────────────────────────
+// Companion to `post_views` for unauthenticated clients. Same composite
+// PK so repeat view pings from the same guest are a no-op at the DB.
+const guestViews = mysqlTable('guest_views', {
+  postId:   int('post_id').notNull(),
+  guestId:  varchar('guest_id', { length: 64 }).notNull(),
+  viewedAt: datetime('viewed_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.postId, table.guestId] }),
+}));
+
+const guestViewsRelations = relations(guestViews, ({ one }) => ({
+  post: one(posts, { fields: [guestViews.postId], references: [posts.id] }),
+}));
+
 // ─── TASKS ──────────────────────────────────────────────────────────────────
 const tasks = mysqlTable('tasks', {
   id:          int('id').primaryKey().autoincrement(),
@@ -165,6 +198,10 @@ module.exports = {
   postStatsRelations,
   reactions,
   reactionsRelations,
+  guestReactions,
+  guestReactionsRelations,
+  guestViews,
+  guestViewsRelations,
   postViews,
   postViewsRelations,
   tasks,

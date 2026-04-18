@@ -22,6 +22,20 @@
       "when": 1776511354169,
       "tag": "0002_keen_komodo",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1776514359326,
+      "tag": "0003_redundant_rumiko_fujikawa",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1776514583007,
+      "tag": "0004_silky_big_bertha",
+      "breakpoints": true
     }
   ]
 }

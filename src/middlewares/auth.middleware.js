@@ -35,5 +35,23 @@ const optionalAuthMiddleware = (req, res, next) => {
   return next();
 };
 
+// Handles guest identity via X-Guest-Id header. Treats guests as "soft users"
+// so reactions/views/shares are deduped per guest ID.
+const guestAuthMiddleware = (req, res, next) => {
+  const guestId = req.headers['x-guest-id'];
+  
+  if (guestId && typeof guestId === 'string' && guestId.length > 0) {
+    // Validate guest ID format (UUID v4)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (uuidRegex.test(guestId)) {
+      req.guest = { id: guestId };
+      req.user = null; // Explicitly set to null to distinguish from authenticated users
+    }
+  }
+  
+  next();
+};
+
 module.exports = authMiddleware;
 module.exports.optionalAuth = optionalAuthMiddleware;
+module.exports.guestAuth = guestAuthMiddleware;

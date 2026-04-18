@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1776495432081,
+      "tag": "0000_heavy_speed",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1776506917371,
+      "tag": "0001_lonely_starfox",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1776511354169,
+      "tag": "0002_keen_komodo",
+      "breakpoints": true
+    }
+  ]
+}

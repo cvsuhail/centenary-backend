@@ -1,11 +1,14 @@
-const { defineConfig } = require('drizzle-kit');
-require('dotenv').config();
+const { defineConfig } = require("drizzle-kit");
 
 module.exports = defineConfig({
-  schema: './src/common/schema.js',
-  out: './drizzle',
-  dialect: 'mysql',
+  schema: "./src/common/schema.js",
+  out: "./drizzle",
+  dialect: "mysql",
   dbCredentials: {
-    url: process.env.DATABASE_URL,
+    host: "127.0.0.1",
+    port: 3306,
+    user: "root",
+    password: "samastha",
+    database: "samastha_centenary",
   },
 });

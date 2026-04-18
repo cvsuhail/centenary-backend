@@ -1,8 +1,9 @@
 const { eq, and, sql, inArray, or, gt, max } = require('drizzle-orm');
 const db = require('../../common/db');
-const { posts, postMedia, postStats, reactions, postViews } = require('../../common/schema');
+const { posts, postMedia, postStats, reactions, postViews, guestReactions, guestViews } = require('../../common/schema');
 const redis = require('../../common/redis');
 const { success, error } = require('../../common/response');
+const { upsertAuthor } = require('../author/author.controller');
 
 // ─── REACTIONS ──────────────────────────────────────────────────────────────
 // The mobile app exposes three reactions. Keep the allowed list in one place
@@ -73,6 +74,18 @@ const attachMyReactions = async (feedPosts, userId) => {
   return feedPosts.map((p) => ({ ...p, myReaction: byPost.get(p.id) || null }));
 };
 
+// Merge the guest user's own reactions (if any) onto a list of posts
+const attachGuestReactions = async (feedPosts, guestId) => {
+  if (!guestId || feedPosts.length === 0) return feedPosts;
+  const ids = feedPosts.map((p) => p.id);
+  const rows = await db
+    .select({ postId: guestReactions.postId, type: guestReactions.type })
+    .from(guestReactions)
+    .where(and(eq(guestReactions.guestId, guestId), inArray(guestReactions.postId, ids)));
+  const byPost = new Map(rows.map((r) => [r.postId, r.type]));
+  return feedPosts.map((p) => ({ ...p, myReaction: byPost.get(p.id) || null }));
+};
+
 // Mirror of attachMyReactions for the persisted views set. Lets the mobile
 // app sort unviewed posts to the top on first render without having to
 // reconcile a local-only set against the server.
@@ -83,6 +96,18 @@ const attachMyViews = async (feedPosts, userId) => {
     .select({ postId: postViews.postId })
     .from(postViews)
     .where(and(eq(postViews.userId, userId), inArray(postViews.postId, ids)));
+  const seen = new Set(rows.map((r) => r.postId));
+  return feedPosts.map((p) => ({ ...p, viewedByMe: seen.has(p.id) }));
+};
+
+// Mirror of attachMyViews for guest users
+const attachGuestViews = async (feedPosts, guestId) => {
+  if (!guestId || feedPosts.length === 0) return feedPosts;
+  const ids = feedPosts.map((p) => p.id);
+  const rows = await db
+    .select({ postId: guestViews.postId })
+    .from(guestViews)
+    .where(and(eq(guestViews.guestId, guestId), inArray(guestViews.postId, ids)));
   const seen = new Set(rows.map((r) => r.postId));
   return feedPosts.map((p) => ({ ...p, viewedByMe: seen.has(p.id) }));
 };
@@ -157,13 +182,22 @@ const getFeed = async (req, res) => {
 // guest user sees on app open.
 const getHomeFeed = async (req, res) => {
   const userId = req.user ? req.user.id : null;
+  const guestId = req.guest ? req.guest.id : null;
+  const isGuest = !!guestId && !userId;
   const cacheKey = 'feed:home';
 
-  if (!userId) {
+  // For guests, check cache first
+  if (isGuest) {
     const cached = await redis.get(cacheKey);
     if (cached) {
       const parsed = JSON.parse(cached);
-      return success(res, { items: parsed }, 'Home feed fetched from cache');
+      // Limit to 3 posts for guest users
+      const limitedItems = parsed.slice(0, 3);
+      return success(res, { 
+        items: limitedItems, 
+        totalCount: parsed.length,
+        hasMore: parsed.length > 3 
+      }, 'Home feed fetched from cache');
     }
   }
 
@@ -173,14 +207,30 @@ const getHomeFeed = async (req, res) => {
     orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
   });
 
-  if (!userId) {
+  // Cache for guests
+  if (isGuest) {
     await redis.set(cacheKey, JSON.stringify(feedPosts), 'EX', 60);
-    return success(res, { items: feedPosts }, 'Home feed fetched');
+    // Limit to 3 posts for guest users
+    const limitedItems = feedPosts.slice(0, 3);
+    return success(res, { 
+      items: limitedItems, 
+      totalCount: feedPosts.length,
+      hasMore: feedPosts.length > 3 
+    }, 'Home feed fetched');
   }
 
-  const withReactions = await attachMyReactions(feedPosts, userId);
-  const personalized = await attachMyViews(withReactions, userId);
-  return success(res, { items: personalized }, 'Home feed fetched');
+  // For authenticated users, personalize the response
+  let personalized = feedPosts;
+  if (userId) {
+    const withReactions = await attachMyReactions(feedPosts, userId);
+    personalized = await attachMyViews(withReactions, userId);
+  }
+
+  return success(res, { 
+    items: personalized, 
+    totalCount: feedPosts.length,
+    hasMore: false // Authenticated users get all posts
+  }, 'Home feed fetched');
 };
 
 // Returns the pinned / important posts — sorted newest-first — so the
@@ -190,6 +240,7 @@ const getHomeFeed = async (req, res) => {
 const getImportantFeed = async (req, res) => {
   const { delegate } = req.query;
   const userId = req.user ? req.user.id : null;
+  const guestId = req.guest ? req.guest.id : null;
   const rawLimit = parseInt(req.query.limit, 10);
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 && rawLimit <= 50 ? rawLimit : 10;
 
@@ -205,9 +256,23 @@ const getImportantFeed = async (req, res) => {
     limit,
   });
 
-  const withReactions = await attachMyReactions(feedPosts, userId);
-  const items = await attachMyViews(withReactions, userId);
-  return success(res, { items }, 'Important feed fetched successfully');
+  // If no important posts, return empty response so mobile can hide the section
+  if (feedPosts.length === 0) {
+    return success(res, { items: [], totalCount: 0 }, 'No important feeds found');
+  }
+
+  let items = feedPosts;
+  
+  // Personalize based on user type
+  if (userId) {
+    const withReactions = await attachMyReactions(feedPosts, userId);
+    items = await attachMyViews(withReactions, userId);
+  } else if (guestId) {
+    const withReactions = await attachGuestReactions(feedPosts, guestId);
+    items = await attachGuestViews(withReactions, guestId);
+  }
+
+  return success(res, { items, totalCount: feedPosts.length }, 'Important feed fetched successfully');
 };
 
 const getPostById = async (req, res) => {
@@ -252,6 +317,12 @@ const createPost = async (req, res) => {
 
   try {
     let newPostId;
+
+    await upsertAuthor({
+      name: authorName,
+      position: authorPosition,
+      dp: authorDp,
+    });
 
     await db.transaction(async (tx) => {
       const [result] = await tx.insert(posts).values({
@@ -306,11 +377,17 @@ const createPost = async (req, res) => {
 //                              increment new per-type (total unchanged).
 const reactToPost = async (req, res) => {
   const { postId, type } = req.body;
-  const userId = req.user.id;
+  const userId = req.user ? req.user.id : null;
+  const guestId = req.guest ? req.guest.id : null;
 
   if (!postId) return error(res, 'postId is required', 400);
   if (!REACTION_TYPES.includes(type)) {
     return error(res, `type must be one of ${REACTION_TYPES.join(', ')}`, 400);
+  }
+
+  // Guests must have a valid guest ID
+  if (!userId && !guestId) {
+    return error(res, 'Authentication or guest ID required', 401);
   }
 
   try {
@@ -319,47 +396,97 @@ const reactToPost = async (req, res) => {
     let activeReaction = type;
 
     await db.transaction(async (tx) => {
-      const [existing] = await tx
-        .select()
-        .from(reactions)
-        .where(and(eq(reactions.postId, postId), eq(reactions.userId, userId)));
+      let existing;
+      
+      if (userId) {
+        // Authenticated user reaction
+        [existing] = await tx
+          .select()
+          .from(reactions)
+          .where(and(eq(reactions.postId, postId), eq(reactions.userId, userId)));
 
-      if (!existing) {
-        await tx.insert(reactions).values({ postId, userId, type });
-        await tx.update(postStats)
-          .set({
-            reactionsCount: sql`${postStats.reactionsCount} + 1`,
-            [nextField]: sql`${nextColumn} + 1`,
-          })
-          .where(eq(postStats.postId, postId));
-        return;
+        if (!existing) {
+          await tx.insert(reactions).values({ postId, userId, type });
+          await tx.update(postStats)
+            .set({
+              reactionsCount: sql`${postStats.reactionsCount} + 1`,
+              [nextField]: sql`${nextColumn} + 1`,
+            })
+            .where(eq(postStats.postId, postId));
+          return;
+        }
+
+        if (existing.type === type) {
+          // Toggling off — remove the row and undo the counters.
+          await tx.delete(reactions).where(eq(reactions.id, existing.id));
+          await tx.update(postStats)
+            .set({
+              reactionsCount: sql`GREATEST(${postStats.reactionsCount} - 1, 0)`,
+              [nextField]: sql`GREATEST(${nextColumn} - 1, 0)`,
+            })
+            .where(eq(postStats.postId, postId));
+          activeReaction = null;
+          return;
+        }
+
+        // Switching from one reaction to another — total stays the same.
+        const prevField = REACTION_TO_FIELD[existing.type];
+        await tx.update(reactions)
+          .set({ type })
+          .where(eq(reactions.id, existing.id));
+
+        const updates = { [nextField]: sql`${nextColumn} + 1` };
+        if (prevField) {
+          const prevColumn = postStats[prevField];
+          updates[prevField] = sql`GREATEST(${prevColumn} - 1, 0)`;
+        }
+        await tx.update(postStats).set(updates).where(eq(postStats.postId, postId));
+        
+      } else if (guestId) {
+        // Guest user reaction
+        [existing] = await tx
+          .select()
+          .from(guestReactions)
+          .where(and(eq(guestReactions.postId, postId), eq(guestReactions.guestId, guestId)));
+
+        if (!existing) {
+          await tx.insert(guestReactions).values({ postId, guestId, type });
+          await tx.update(postStats)
+            .set({
+              reactionsCount: sql`${postStats.reactionsCount} + 1`,
+              [nextField]: sql`${nextColumn} + 1`,
+            })
+            .where(eq(postStats.postId, postId));
+          return;
+        }
+
+        if (existing.type === type) {
+          // Toggling off — remove the row and undo the counters.
+          await tx.delete(guestReactions).where(eq(guestReactions.id, existing.id));
+          await tx.update(postStats)
+            .set({
+              reactionsCount: sql`GREATEST(${postStats.reactionsCount} - 1, 0)`,
+              [nextField]: sql`GREATEST(${nextColumn} - 1, 0)`,
+            })
+            .where(eq(postStats.postId, postId));
+          activeReaction = null;
+          return;
+        }
+
+        // Switching from one reaction to another — total stays the same.
+        const prevField = REACTION_TO_FIELD[existing.type];
+        await tx.update(guestReactions)
+          .set({ type })
+          .where(eq(guestReactions.id, existing.id));
+
+        const updates = { [nextField]: sql`${nextColumn} + 1` };
+        if (prevField) {
+          const prevColumn = postStats[prevField];
+          updates[prevField] = sql`GREATEST(${prevColumn} - 1, 0)`;
+        }
+        await tx.update(postStats).set(updates).where(eq(postStats.postId, postId));
       }
-
-      if (existing.type === type) {
-        // Toggling off — remove the row and undo the counters.
-        await tx.delete(reactions).where(eq(reactions.id, existing.id));
-        await tx.update(postStats)
-          .set({
-            reactionsCount: sql`GREATEST(${postStats.reactionsCount} - 1, 0)`,
-            [nextField]: sql`GREATEST(${nextColumn} - 1, 0)`,
-          })
-          .where(eq(postStats.postId, postId));
-        activeReaction = null;
-        return;
-      }
-
-      // Switching from one reaction to another — total stays the same.
-      const prevField = REACTION_TO_FIELD[existing.type];
-      await tx.update(reactions)
-        .set({ type })
-        .where(eq(reactions.id, existing.id));
-
-      const updates = { [nextField]: sql`${nextColumn} + 1` };
-      if (prevField) {
-        const prevColumn = postStats[prevField];
-        updates[prevField] = sql`GREATEST(${prevColumn} - 1, 0)`;
-      }
-      await tx.update(postStats).set(updates).where(eq(postStats.postId, postId));
+      
       await bumpPostUpdatedAt(postId, tx);
     });
 
@@ -376,10 +503,17 @@ const reactToPost = async (req, res) => {
 // the same post past the view trigger twice in quick succession.
 const viewPost = async (req, res) => {
   const { postId } = req.body;
-  const userId = req.user.id;
+  const userId = req.user ? req.user.id : null;
+  const guestId = req.guest ? req.guest.id : null;
+  
   if (!postId) return error(res, 'postId is required', 400);
+  
+  // Guests must have a valid guest ID
+  if (!userId && !guestId) {
+    return error(res, 'Authentication or guest ID required', 401);
+  }
 
-  const viewKey = `view:${postId}:${userId}`;
+  const viewKey = userId ? `view:${postId}:${userId}` : `guest_view:${postId}:${guestId}`;
   const cached = await redis.get(viewKey);
   if (cached) return success(res, null, 'View already recorded');
 
@@ -389,11 +523,24 @@ const viewPost = async (req, res) => {
 
   let inserted = false;
   try {
-    const [result] = await db.insert(postViews).values({
-      postId: Number(postId),
-      userId: Number(userId),
-      viewedAt: new Date(),
-    }).onDuplicateKeyUpdate({ set: { userId: Number(userId) } });
+    let result;
+    
+    if (userId) {
+      // Authenticated user view
+      [result] = await db.insert(postViews).values({
+        postId: Number(postId),
+        userId: Number(userId),
+        viewedAt: new Date(),
+      }).onDuplicateKeyUpdate({ set: { userId: Number(userId) } });
+    } else if (guestId) {
+      // Guest user view
+      [result] = await db.insert(guestViews).values({
+        postId: Number(postId),
+        guestId: guestId,
+        viewedAt: new Date(),
+      }).onDuplicateKeyUpdate({ set: { guestId: guestId } });
+    }
+    
     // `affectedRows` is 1 for a real insert and 2 for a row that was
     // updated via ON DUPLICATE KEY; anything other than 1 means the row
     // already existed (MySQL quirk) so we don't double-count.
@@ -451,6 +598,14 @@ const updatePost = async (req, res) => {
   try {
     const [existing] = await db.select().from(posts).where(eq(posts.id, postId));
     if (!existing) return error(res, 'Post not found', 404);
+
+    if (authorName !== undefined || authorPosition !== undefined || authorDp !== undefined) {
+      await upsertAuthor({
+        name: authorName ?? existing.authorName,
+        position: authorPosition ?? existing.authorPosition,
+        dp: authorDp ?? existing.authorDp,
+      });
+    }
 
     const updates = { updatedAt: sql`NOW()` };
     if (title !== undefined) updates.title = title;

@@ -36,6 +36,20 @@ const posts = mysqlTable('posts', {
   updatedAt:     datetime('updated_at').notNull().default(new Date()),
 });
 
+// ─── AUTHORS ────────────────────────────────────────────────────────────────
+// Reusable author directory for the admin panel. Admins can type a name,
+// pick an existing author to auto-fill position + DP, or create a new one.
+const authors = mysqlTable('authors', {
+  id:            int('id').primaryKey().autoincrement(),
+  name:          varchar('name', { length: 255 }).notNull(),
+  position:      varchar('position', { length: 255 }).notNull(),
+  dp:            varchar('dp', { length: 1000 }),
+  createdAt:     datetime('created_at').notNull().default(new Date()),
+  updatedAt:     datetime('updated_at').notNull().default(new Date()),
+}, (table) => ({
+  uniqAuthor: uniqueIndex('uniq_author').on(table.name, table.position),
+}));
+
 const postsRelations = relations(posts, ({ many, one }) => ({
   media:     many(postMedia),
   stats:     one(postStats, { fields: [posts.id], references: [postStats.postId] }),
@@ -106,6 +120,37 @@ const reactionsRelations = relations(reactions, ({ one }) => ({
   user: one(users, { fields: [reactions.userId], references: [users.id] }),
 }));
 
+// ─── GUEST REACTIONS ───────────────────────────────────────────────────────────
+// Guest reactions are stored separately to avoid foreign key constraints
+// with the users table since guests don't have user records.
+const guestReactions = mysqlTable('guest_reactions', {
+  id:       int('id').primaryKey().autoincrement(),
+  postId:   int('post_id').notNull(),
+  guestId:  varchar('guest_id', { length: 36 }).notNull(), // UUID v4
+  type:     varchar('type', { length: 50 }).notNull(),
+}, (table) => ({
+  uniqGuestReaction: uniqueIndex('uniq_guest_reaction').on(table.postId, table.guestId),
+}));
+
+const guestReactionsRelations = relations(guestReactions, ({ one }) => ({
+  post: one(posts, { fields: [guestReactions.postId], references: [posts.id] }),
+}));
+
+// ─── GUEST VIEWS ─────────────────────────────────────────────────────────────
+// Guest views are stored separately to avoid foreign key constraints
+// with the users table since guests don't have user records.
+const guestViews = mysqlTable('guest_views', {
+  postId:   int('post_id').notNull(),
+  guestId:  varchar('guest_id', { length: 36 }).notNull(), // UUID v4
+  viewedAt: datetime('viewed_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.postId, table.guestId] }),
+}));
+
+const guestViewsRelations = relations(guestViews, ({ one }) => ({
+  post: one(posts, { fields: [guestViews.postId], references: [posts.id] }),
+}));
+
 // ─── TASKS ──────────────────────────────────────────────────────────────────
 const tasks = mysqlTable('tasks', {
   id:          int('id').primaryKey().autoincrement(),
@@ -159,14 +204,19 @@ module.exports = {
   usersRelations,
   posts,
   postsRelations,
+  authors,
   postMedia,
   postMediaRelations,
   postStats,
   postStatsRelations,
   reactions,
   reactionsRelations,
+  guestReactions,
+  guestReactionsRelations,
   postViews,
   postViewsRelations,
+  guestViews,
+  guestViewsRelations,
   tasks,
   announcements,
   eventConfig,

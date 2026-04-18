@@ -1,4 +1,4 @@
-const { mysqlTable, int, varchar, boolean, datetime, json, text, uniqueIndex } = require('drizzle-orm/mysql-core');
+const { mysqlTable, int, varchar, boolean, datetime, json, text, uniqueIndex, primaryKey } = require('drizzle-orm/mysql-core');
 const { relations } = require('drizzle-orm');
 
 // ─── USERS ──────────────────────────────────────────────────────────────────
@@ -24,12 +24,14 @@ const posts = mysqlTable('posts', {
   description:   text('description'),
   mediaType:     varchar('media_type', { length: 50 }),
   mediaLayout:   varchar('media_layout', { length: 50 }),
-  authorName:    varchar('author_name', { length: 255 }),
-  authorDp:      varchar('author_dp', { length: 1000 }),
-  delegation:    varchar('delegation', { length: 100 }),
-  isImportant:   boolean('is_important').notNull().default(false),
-  priorityStart: datetime('priority_start'),
-  priorityEnd:   datetime('priority_end'),
+  authorName:     varchar('author_name', { length: 255 }),
+  authorPosition: varchar('author_position', { length: 255 }),
+  authorDp:       varchar('author_dp', { length: 1000 }),
+  delegation:     varchar('delegation', { length: 100 }),
+  isImportant:    boolean('is_important').notNull().default(false),
+  isHomeFeed:     boolean('is_home_feed').notNull().default(false),
+  priorityStart:  datetime('priority_start'),
+  priorityEnd:    datetime('priority_end'),
   createdAt:     datetime('created_at').notNull().default(new Date()),
   updatedAt:     datetime('updated_at').notNull().default(new Date()),
 });
@@ -38,6 +40,24 @@ const postsRelations = relations(posts, ({ many, one }) => ({
   media:     many(postMedia),
   stats:     one(postStats, { fields: [posts.id], references: [postStats.postId] }),
   reactions: many(reactions),
+  views:     many(postViews),
+}));
+
+// ─── POST VIEWS ─────────────────────────────────────────────────────────────
+// Persisted "has this user viewed this post?" set. Promoted out of Redis
+// (which used a 24h TTL'd key) so the mobile app's "show unviewed posts
+// first" sort still holds after a day of app inactivity.
+const postViews = mysqlTable('post_views', {
+  postId:   int('post_id').notNull(),
+  userId:   int('user_id').notNull(),
+  viewedAt: datetime('viewed_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.postId, table.userId] }),
+}));
+
+const postViewsRelations = relations(postViews, ({ one }) => ({
+  post: one(posts, { fields: [postViews.postId], references: [posts.id] }),
+  user: one(users, { fields: [postViews.userId], references: [users.id] }),
 }));
 
 // ─── POST MEDIA ─────────────────────────────────────────────────────────────
@@ -145,6 +165,8 @@ module.exports = {
   postStatsRelations,
   reactions,
   reactionsRelations,
+  postViews,
+  postViewsRelations,
   tasks,
   announcements,
   eventConfig,

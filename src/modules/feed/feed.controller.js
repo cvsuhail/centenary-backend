@@ -1,6 +1,6 @@
 const { eq, and, sql, inArray, or, gt, max } = require('drizzle-orm');
 const db = require('../../common/db');
-const { posts, postMedia, postStats, reactions } = require('../../common/schema');
+const { posts, postMedia, postStats, reactions, postViews } = require('../../common/schema');
 const redis = require('../../common/redis');
 const { success, error } = require('../../common/response');
 
@@ -27,10 +27,15 @@ const bumpPostUpdatedAt = async (postId, txOrDb = db) => {
     .where(eq(posts.id, postId));
 };
 
+// Caches we bust on any write. `feed:delegation:*` powers the main Feed tab,
+// `feed:home` powers the new public home-screen feed, and the important
+// rail has its own delegation-scoped key set.
 const invalidateFeedCaches = async () => {
-  await Promise.all(
-    DELEGATIONS.map((d) => redis.del(`feed:delegation:${d}`))
-  );
+  await Promise.all([
+    ...DELEGATIONS.map((d) => redis.del(`feed:delegation:${d}`)),
+    ...DELEGATIONS.map((d) => redis.del(`feed:important:${d}`)),
+    redis.del('feed:home'),
+  ]);
   await redis.set('sync:lastUpdated', new Date().toISOString());
 };
 
@@ -68,6 +73,20 @@ const attachMyReactions = async (feedPosts, userId) => {
   return feedPosts.map((p) => ({ ...p, myReaction: byPost.get(p.id) || null }));
 };
 
+// Mirror of attachMyReactions for the persisted views set. Lets the mobile
+// app sort unviewed posts to the top on first render without having to
+// reconcile a local-only set against the server.
+const attachMyViews = async (feedPosts, userId) => {
+  if (!userId || feedPosts.length === 0) return feedPosts;
+  const ids = feedPosts.map((p) => p.id);
+  const rows = await db
+    .select({ postId: postViews.postId })
+    .from(postViews)
+    .where(and(eq(postViews.userId, userId), inArray(postViews.postId, ids)));
+  const seen = new Set(rows.map((r) => r.postId));
+  return feedPosts.map((p) => ({ ...p, viewedByMe: seen.has(p.id) }));
+};
+
 // Response envelope for the feed. Always carries a `lastUpdated` so the
 // mobile app can stash it in Hive and send it back on the next request to
 // avoid re-downloading unchanged data.
@@ -77,11 +96,26 @@ const buildFeedEnvelope = (items, lastUpdated, notModified = false) => ({
   notModified,
 });
 
+// Main feed tab filter: every post EXCEPT ones that are marked home-feed-
+// only (home-feed + not important). Keeps Home–exclusive content out of
+// the main Feed tab while still letting admins flag something important on
+// both surfaces by flipping both flags.
+const mainFeedScope = (delegate) => {
+  const delegationClause = delegate
+    ? or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
+    : undefined;
+  const notHomeOnly = or(eq(posts.isHomeFeed, false), eq(posts.isImportant, true));
+  return delegationClause ? and(delegationClause, notHomeOnly) : notHomeOnly;
+};
+
 const getFeed = async (req, res) => {
   const { delegate } = req.query;
   const since = parseSince(req.query.since);
   const userId = req.user ? req.user.id : null;
-  const cacheKey = `feed:delegation:${delegate || 'all'}`;
+
+  // Guard: the main feed is volunteer-only. Guests should hit /feed/home
+  // or /feed/important (both public).
+  if (!userId) return error(res, 'Authentication required', 401);
 
   // Short-circuit: if the caller already has data at-or-after the max
   // updatedAt in scope, don't touch the DB query at all. This is the hot
@@ -95,44 +129,51 @@ const getFeed = async (req, res) => {
     );
   }
 
-  // Serve the shared cache only for unauthenticated requests. When a user
-  // is present we need to stitch in their own `myReaction` values, so
-  // caching would leak one user's reactions to another.
+  const feedPosts = await db.query.posts.findMany({
+    where: mainFeedScope(delegate),
+    with: { media: true, stats: true },
+    orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
+  });
+
+  const withReactions = await attachMyReactions(feedPosts, userId);
+  const personalized = await attachMyViews(withReactions, userId);
+  return success(
+    res,
+    buildFeedEnvelope(personalized, lastUpdatedAt, false),
+    'Feed fetched from database',
+  );
+};
+
+// Public home-screen feed. Serves posts flagged `isHomeFeed` ordered with
+// important first so admins who also toggle `isImportant` get the usual
+// "pinned at top" behaviour. No auth required — this is the first thing a
+// guest user sees on app open.
+const getHomeFeed = async (req, res) => {
+  const userId = req.user ? req.user.id : null;
+  const cacheKey = 'feed:home';
+
   if (!userId) {
     const cached = await redis.get(cacheKey);
     if (cached) {
       const parsed = JSON.parse(cached);
-      return success(
-        res,
-        buildFeedEnvelope(parsed, lastUpdatedAt, false),
-        'Feed fetched from cache',
-      );
+      return success(res, { items: parsed }, 'Home feed fetched from cache');
     }
   }
 
   const feedPosts = await db.query.posts.findMany({
-    where: delegate
-      ? or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
-      : undefined,
+    where: eq(posts.isHomeFeed, true),
     with: { media: true, stats: true },
     orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
   });
 
   if (!userId) {
     await redis.set(cacheKey, JSON.stringify(feedPosts), 'EX', 60);
-    return success(
-      res,
-      buildFeedEnvelope(feedPosts, lastUpdatedAt, false),
-      'Feed fetched from database',
-    );
+    return success(res, { items: feedPosts }, 'Home feed fetched');
   }
 
-  const personalized = await attachMyReactions(feedPosts, userId);
-  return success(
-    res,
-    buildFeedEnvelope(personalized, lastUpdatedAt, false),
-    'Feed fetched from database',
-  );
+  const withReactions = await attachMyReactions(feedPosts, userId);
+  const personalized = await attachMyViews(withReactions, userId);
+  return success(res, { items: personalized }, 'Home feed fetched');
 };
 
 // Returns the pinned / important posts — sorted newest-first — so the
@@ -157,7 +198,8 @@ const getImportantFeed = async (req, res) => {
     limit,
   });
 
-  const items = await attachMyReactions(feedPosts, userId);
+  const withReactions = await attachMyReactions(feedPosts, userId);
+  const items = await attachMyViews(withReactions, userId);
   return success(res, { items }, 'Important feed fetched successfully');
 };
 
@@ -172,12 +214,34 @@ const getPostById = async (req, res) => {
 
   if (!post) return error(res, 'Post not found', 404);
 
-  const [personalized] = await attachMyReactions([post], userId);
+  const [withReactions] = await attachMyReactions([post], userId);
+  const [personalized] = await attachMyViews([withReactions], userId);
   return success(res, personalized, 'Post fetched successfully');
 };
 
 const createPost = async (req, res) => {
-  const { title, description, mediaType, mediaLayout, authorName, authorDp, delegation, isImportant, media } = req.body;
+  const {
+    title,
+    description,
+    mediaType,
+    mediaLayout,
+    authorName,
+    authorPosition,
+    authorDp,
+    delegation,
+    isImportant,
+    isHomeFeed,
+    media,
+  } = req.body;
+
+  // Author identity is required so every post can surface a byline in the
+  // mobile feed card (name + role + avatar).
+  if (!authorName || !String(authorName).trim()) {
+    return error(res, 'authorName is required', 400);
+  }
+  if (!authorPosition || !String(authorPosition).trim()) {
+    return error(res, 'authorPosition is required', 400);
+  }
 
   try {
     let newPostId;
@@ -189,9 +253,11 @@ const createPost = async (req, res) => {
         mediaType,
         mediaLayout,
         authorName,
+        authorPosition,
         authorDp,
         delegation,
         isImportant: isImportant || false,
+        isHomeFeed: isHomeFeed || false,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -297,14 +363,39 @@ const reactToPost = async (req, res) => {
   }
 };
 
+// Unique views, tracked in MySQL so the "viewed by me" signal survives
+// beyond Redis TTL. We also keep a short-lived Redis key as a cheap
+// de-dupe in front of the insert for the hot path where a user scrolls
+// the same post past the view trigger twice in quick succession.
 const viewPost = async (req, res) => {
   const { postId } = req.body;
   const userId = req.user.id;
-  const viewKey = `view:${postId}:${userId}`;
+  if (!postId) return error(res, 'postId is required', 400);
 
-  const hasViewed = await redis.get(viewKey);
-  if (!hasViewed) {
-    await redis.set(viewKey, '1', 'EX', 86400);
+  const viewKey = `view:${postId}:${userId}`;
+  const cached = await redis.get(viewKey);
+  if (cached) return success(res, null, 'View already recorded');
+
+  // Best-effort Redis reservation; a race where two requests both miss is
+  // fine because the MySQL INSERT IGNORE below is the real gatekeeper.
+  await redis.set(viewKey, '1', 'EX', 86400);
+
+  let inserted = false;
+  try {
+    const [result] = await db.insert(postViews).values({
+      postId: Number(postId),
+      userId: Number(userId),
+      viewedAt: new Date(),
+    }).onDuplicateKeyUpdate({ set: { userId: Number(userId) } });
+    // `affectedRows` is 1 for a real insert and 2 for a row that was
+    // updated via ON DUPLICATE KEY; anything other than 1 means the row
+    // already existed (MySQL quirk) so we don't double-count.
+    inserted = result && result.affectedRows === 1;
+  } catch (err) {
+    console.error('[Feed][view-post] Failed to record view', err);
+  }
+
+  if (inserted) {
     await db.update(postStats)
       .set({ viewsCount: sql`${postStats.viewsCount} + 1` })
       .where(eq(postStats.postId, postId));
@@ -340,9 +431,11 @@ const updatePost = async (req, res) => {
     mediaType,
     mediaLayout,
     authorName,
+    authorPosition,
     authorDp,
     delegation,
     isImportant,
+    isHomeFeed,
     media,
   } = req.body;
 
@@ -358,9 +451,11 @@ const updatePost = async (req, res) => {
     if (mediaType !== undefined) updates.mediaType = mediaType;
     if (mediaLayout !== undefined) updates.mediaLayout = mediaLayout;
     if (authorName !== undefined) updates.authorName = authorName;
+    if (authorPosition !== undefined) updates.authorPosition = authorPosition;
     if (authorDp !== undefined) updates.authorDp = authorDp;
     if (delegation !== undefined) updates.delegation = delegation;
     if (isImportant !== undefined) updates.isImportant = Boolean(isImportant);
+    if (isHomeFeed !== undefined) updates.isHomeFeed = Boolean(isHomeFeed);
 
     await db.transaction(async (tx) => {
       await tx.update(posts).set(updates).where(eq(posts.id, postId));
@@ -406,6 +501,7 @@ const deletePost = async (req, res) => {
       await tx.delete(postMedia).where(eq(postMedia.postId, postId));
       await tx.delete(postStats).where(eq(postStats.postId, postId));
       await tx.delete(reactions).where(eq(reactions.postId, postId));
+      await tx.delete(postViews).where(eq(postViews.postId, postId));
       await tx.delete(posts).where(eq(posts.id, postId));
     });
 
@@ -443,6 +539,7 @@ const getStats = async (req, res) => {
 
 module.exports = {
   getFeed,
+  getHomeFeed,
   getImportantFeed,
   getPostById,
   createPost,

@@ -100,10 +100,15 @@ const buildFeedEnvelope = (items, lastUpdated, notModified = false) => ({
 // only (home-feed + not important). Keeps Home–exclusive content out of
 // the main Feed tab while still letting admins flag something important on
 // both surfaces by flipping both flags.
-const mainFeedScope = (delegate) => {
+//
+// When `includeHomeOnly` is true (i.e. the caller is an admin) we drop the
+// home-only exclusion entirely so the admin panel — which uses this same
+// endpoint to list every post — can see home-feed-only rows too.
+const mainFeedScope = (delegate, { includeHomeOnly = false } = {}) => {
   const delegationClause = delegate
     ? or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
     : undefined;
+  if (includeHomeOnly) return delegationClause;
   const notHomeOnly = or(eq(posts.isHomeFeed, false), eq(posts.isImportant, true));
   return delegationClause ? and(delegationClause, notHomeOnly) : notHomeOnly;
 };
@@ -112,6 +117,7 @@ const getFeed = async (req, res) => {
   const { delegate } = req.query;
   const since = parseSince(req.query.since);
   const userId = req.user ? req.user.id : null;
+  const isAdmin = req.user && req.user.role === 'admin';
 
   // Guard: the main feed is volunteer-only. Guests should hit /feed/home
   // or /feed/important (both public).
@@ -119,9 +125,10 @@ const getFeed = async (req, res) => {
 
   // Short-circuit: if the caller already has data at-or-after the max
   // updatedAt in scope, don't touch the DB query at all. This is the hot
-  // path for idle mobile clients checking in.
+  // path for idle mobile clients checking in. Admins skip this — their
+  // dashboards need an authoritative listing every time.
   const lastUpdatedAt = await maxFeedUpdatedAt(delegate);
-  if (since && lastUpdatedAt && since >= lastUpdatedAt) {
+  if (!isAdmin && since && lastUpdatedAt && since >= lastUpdatedAt) {
     return success(
       res,
       buildFeedEnvelope([], lastUpdatedAt, true),
@@ -130,7 +137,7 @@ const getFeed = async (req, res) => {
   }
 
   const feedPosts = await db.query.posts.findMany({
-    where: mainFeedScope(delegate),
+    where: mainFeedScope(delegate, { includeHomeOnly: isAdmin }),
     with: { media: true, stats: true },
     orderBy: (posts, { desc }) => [desc(posts.isImportant), desc(posts.createdAt)],
   });

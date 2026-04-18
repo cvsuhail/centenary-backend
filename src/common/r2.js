@@ -85,8 +85,10 @@ const extOf = (name) => {
   return idx === -1 ? '' : name.slice(idx + 1).toLowerCase();
 };
 
-// Builds the object key. Kept hierarchical so the bucket stays browsable.
-//   posts/<kind>/<yyyy>/<mm>/<dd>/<nanoid>-<sanitized-filename>
+// Builds the object key. Kept hierarchical so the bucket stays browsable and
+// every filename carries a unique `_post` marker so operators can immediately
+// tell a post upload apart from avatars or any future non-post assets:
+//   posts/<kind>/<yyyy>/<mm>/<dd>/<nanoid>_post_<sanitized-filename>
 const buildKey = ({ kind, fileName }) => {
   const now = new Date();
   const yyyy = String(now.getUTCFullYear());
@@ -94,7 +96,7 @@ const buildKey = ({ kind, fileName }) => {
   const dd = String(now.getUTCDate()).padStart(2, '0');
   const safe = sanitizeFileName(fileName);
   const id = nanoid(12);
-  return `posts/${kind}/${yyyy}/${mm}/${dd}/${id}-${safe}`;
+  return `posts/${kind}/${yyyy}/${mm}/${dd}/${id}_post_${safe}`;
 };
 
 const isContentTypeValid = (kind, contentType, fileName) => {

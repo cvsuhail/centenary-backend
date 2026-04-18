@@ -96,6 +96,44 @@ const tasks = mysqlTable('tasks', {
   updatedAt:   datetime('updated_at').notNull().default(new Date()),
 });
 
+// ─── ANNOUNCEMENTS ──────────────────────────────────────────────────────────
+// Powers the sticky dock above the mobile bottom nav. `active` gates whether
+// the announcement is visible at all; `startsAt`/`endsAt` are optional
+// windows layered on top of `active` so the admin can schedule in advance
+// without having to toggle the flag manually.
+//
+// `actionType` + `actionValue` together describe what happens on the CTA
+// press in mobile:
+//   none  → no CTA rendered
+//   url   → open external URL via url_launcher
+//   route → Navigator.pushNamed(context, actionValue)
+const announcements = mysqlTable('announcements', {
+  id:          int('id').primaryKey().autoincrement(),
+  title:       varchar('title', { length: 255 }).notNull(),
+  body:        text('body'),
+  icon:        varchar('icon', { length: 100 }).notNull().default('campaign'),
+  ctaLabel:    varchar('cta_label', { length: 100 }),
+  actionType:  varchar('action_type', { length: 20 }).notNull().default('none'),
+  actionValue: varchar('action_value', { length: 1000 }),
+  active:      boolean('active').notNull().default(true),
+  startsAt:    datetime('starts_at'),
+  endsAt:      datetime('ends_at'),
+  createdAt:   datetime('created_at').notNull().default(new Date()),
+  updatedAt:   datetime('updated_at').notNull().default(new Date()),
+});
+
+// ─── EVENT CONFIG ───────────────────────────────────────────────────────────
+// Singleton row (enforced at the controller layer — we always read/write
+// id=1) that the mobile app queries for the dynamic countdown. Kept as a
+// regular table rather than a KV so future per-event fields (hero image,
+// colour accent) can live in the same row.
+const eventConfig = mysqlTable('event_config', {
+  id:              int('id').primaryKey(),
+  countdownTitle:  varchar('countdown_title', { length: 255 }).notNull().default('Samastha Centenary'),
+  countdownTarget: datetime('countdown_target').notNull(),
+  updatedAt:       datetime('updated_at').notNull().default(new Date()),
+});
+
 module.exports = {
   users,
   usersRelations,
@@ -108,4 +146,6 @@ module.exports = {
   reactions,
   reactionsRelations,
   tasks,
+  announcements,
+  eventConfig,
 };

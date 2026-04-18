@@ -5,11 +5,12 @@ const authMiddleware = require('../../middlewares/auth.middleware');
 
 const { optionalAuth } = authMiddleware;
 
-// Public but personalizes the `myReaction` field when a token is supplied.
-router.get('/', optionalAuth, feedController.getFeed);
+// Main Feed tab — volunteer-only. Guests use /feed/home + /feed/important.
+router.get('/', authMiddleware, feedController.getFeed);
 router.get('/stats', authMiddleware, feedController.getStats);
-// Static path must be declared before `/:postId` so Express doesn't route
-// a GET /feed/important request into the dynamic-id handler.
+// Static paths must be declared before `/:postId` so Express doesn't route
+// a GET /feed/<name> request into the dynamic-id handler.
+router.get('/home', optionalAuth, feedController.getHomeFeed);
 router.get('/important', optionalAuth, feedController.getImportantFeed);
 router.get('/:postId', optionalAuth, feedController.getPostById);
 router.post('/create', authMiddleware, feedController.createPost);

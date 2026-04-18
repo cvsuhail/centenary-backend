@@ -8,6 +8,9 @@ const { optionalAuth } = authMiddleware;
 // Public but personalizes the `myReaction` field when a token is supplied.
 router.get('/', optionalAuth, feedController.getFeed);
 router.get('/stats', authMiddleware, feedController.getStats);
+// Static path must be declared before `/:postId` so Express doesn't route
+// a GET /feed/important request into the dynamic-id handler.
+router.get('/important', optionalAuth, feedController.getImportantFeed);
 router.get('/:postId', optionalAuth, feedController.getPostById);
 router.post('/create', authMiddleware, feedController.createPost);
 router.put('/:postId', authMiddleware, feedController.updatePost);

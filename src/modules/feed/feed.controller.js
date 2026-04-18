@@ -135,6 +135,32 @@ const getFeed = async (req, res) => {
   );
 };
 
+// Returns the pinned / important posts — sorted newest-first — so the
+// mobile Home tab can render the "Important feeds" rail without pulling
+// the full feed and filtering client-side. Accepts an optional ?limit so
+// we don't over-fetch on slow networks.
+const getImportantFeed = async (req, res) => {
+  const { delegate } = req.query;
+  const userId = req.user ? req.user.id : null;
+  const rawLimit = parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 && rawLimit <= 50 ? rawLimit : 10;
+
+  const feedPosts = await db.query.posts.findMany({
+    where: delegate
+      ? and(
+          eq(posts.isImportant, true),
+          or(eq(posts.delegation, delegate), eq(posts.delegation, 'ALL'))
+        )
+      : eq(posts.isImportant, true),
+    with: { media: true, stats: true },
+    orderBy: (posts, { desc }) => [desc(posts.createdAt)],
+    limit,
+  });
+
+  const items = await attachMyReactions(feedPosts, userId);
+  return success(res, { items }, 'Important feed fetched successfully');
+};
+
 const getPostById = async (req, res) => {
   const { postId } = req.params;
   const userId = req.user ? req.user.id : null;
@@ -417,6 +443,7 @@ const getStats = async (req, res) => {
 
 module.exports = {
   getFeed,
+  getImportantFeed,
   getPostById,
   createPost,
   updatePost,

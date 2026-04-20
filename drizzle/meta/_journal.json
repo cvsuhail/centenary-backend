@@ -36,6 +36,20 @@
       "when": 1776514583007,
       "tag": "0004_silky_big_bertha",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1776605261593,
+      "tag": "0005_goofy_yellow_claw",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1776606267693,
+      "tag": "0006_moaning_strong_guy",
+      "breakpoints": true
     }
   ]
 }

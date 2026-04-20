@@ -199,6 +199,123 @@ const eventConfig = mysqlTable('event_config', {
   updatedAt:       datetime('updated_at').notNull().default(new Date()),
 });
 
+// ─── STORIES ───────────────────────────────────────────────────────────────
+// Instagram-style stories with visibility controls for different user types
+const stories = mysqlTable('stories', {
+  id:              int('id').primaryKey().autoincrement(),
+  authorId:        int('author_id').notNull(),
+  authorName:      varchar('author_name', { length: 255 }).notNull(),
+  authorPosition:  varchar('author_position', { length: 255 }).notNull(),
+  authorDp:        varchar('author_dp', { length: 1000 }),
+  topic:           varchar('topic', { length: 255 }),
+  // Visibility: which user types can see this story
+  visibleToGuests: boolean('visible_to_guests').notNull().default(true),
+  visibleToDelegates: boolean('visible_to_delegates').notNull().default(true),
+  // Special delegation filtering (SSF, SYS, SKSSF, KMJ, RSC, or null for all)
+  specialDelegation: varchar('special_delegation', { length: 50 }),
+  // Story expiration (24 hours by default like Instagram)
+  expiresAt:       datetime('expires_at').notNull(),
+  createdAt:       datetime('created_at').notNull().default(new Date()),
+  updatedAt:       datetime('updated_at').notNull().default(new Date()),
+});
+
+const storiesRelations = relations(stories, ({ many, one }) => ({
+  media:     many(storyMedia),
+  stats:     one(storyStats, { fields: [stories.id], references: [storyStats.storyId] }),
+  reactions: many(storyReactions),
+  views:     many(storyViews),
+  author:    one(authors, { fields: [stories.authorId], references: [authors.id] }),
+}));
+
+// ─── STORY MEDIA ─────────────────────────────────────────────────────────────
+// Images or videos for a story (can be multiple)
+const storyMedia = mysqlTable('story_media', {
+  id:         int('id').primaryKey().autoincrement(),
+  storyId:    int('story_id').notNull(),
+  url:        varchar('url', { length: 1000 }).notNull(),
+  type:       varchar('type', { length: 50 }).notNull(), // 'image' or 'video'
+  orderIndex: int('order_index').notNull().default(0),
+});
+
+const storyMediaRelations = relations(storyMedia, ({ one }) => ({
+  story: one(stories, { fields: [storyMedia.storyId], references: [stories.id] }),
+}));
+
+// ─── STORY STATS ─────────────────────────────────────────────────────────────
+// Aggregated stats for stories (views, reactions by type)
+const storyStats = mysqlTable('story_stats', {
+  storyId:         int('story_id').primaryKey(),
+  viewsCount:      int('views_count').notNull().default(0),
+  reactionsCount:  int('reactions_count').notNull().default(0),
+  likeCount:       int('like_count').notNull().default(0),
+  supportCount:    int('support_count').notNull().default(0),
+  appreciateCount: int('appreciate_count').notNull().default(0),
+});
+
+const storyStatsRelations = relations(storyStats, ({ one }) => ({
+  story: one(stories, { fields: [storyStats.storyId], references: [stories.id] }),
+}));
+
+// ─── STORY REACTIONS ─────────────────────────────────────────────────────────
+// User reactions to stories
+const storyReactions = mysqlTable('story_reactions', {
+  id:      int('id').primaryKey().autoincrement(),
+  storyId: int('story_id').notNull(),
+  userId:  int('user_id').notNull(),
+  type:    varchar('type', { length: 50 }).notNull(),
+}, (table) => ({
+  uniqReaction: uniqueIndex('uniq_story_reaction').on(table.storyId, table.userId),
+}));
+
+const storyReactionsRelations = relations(storyReactions, ({ one }) => ({
+  story: one(stories, { fields: [storyReactions.storyId], references: [stories.id] }),
+  user:  one(users, { fields: [storyReactions.userId], references: [users.id] }),
+}));
+
+// ─── STORY VIEWS ─────────────────────────────────────────────────────────────
+// Track which users have viewed which stories
+const storyViews = mysqlTable('story_views', {
+  storyId:  int('story_id').notNull(),
+  userId:   int('user_id').notNull(),
+  viewedAt: datetime('viewed_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.storyId, table.userId] }),
+}));
+
+const storyViewsRelations = relations(storyViews, ({ one }) => ({
+  story: one(stories, { fields: [storyViews.storyId], references: [stories.id] }),
+  user:  one(users, { fields: [storyViews.userId], references: [users.id] }),
+}));
+
+// ─── GUEST STORY REACTIONS ───────────────────────────────────────────────────
+// Guest reactions to stories (no user record)
+const guestStoryReactions = mysqlTable('guest_story_reactions', {
+  id:       int('id').primaryKey().autoincrement(),
+  storyId:  int('story_id').notNull(),
+  guestId:  varchar('guest_id', { length: 36 }).notNull(), // UUID v4
+  type:     varchar('type', { length: 50 }).notNull(),
+}, (table) => ({
+  uniqGuestReaction: uniqueIndex('uniq_guest_story_reaction').on(table.storyId, table.guestId),
+}));
+
+const guestStoryReactionsRelations = relations(guestStoryReactions, ({ one }) => ({
+  story: one(stories, { fields: [guestStoryReactions.storyId], references: [stories.id] }),
+}));
+
+// ─── GUEST STORY VIEWS ───────────────────────────────────────────────────────
+// Track which guests have viewed which stories
+const guestStoryViews = mysqlTable('guest_story_views', {
+  storyId:  int('story_id').notNull(),
+  guestId:  varchar('guest_id', { length: 36 }).notNull(), // UUID v4
+  viewedAt: datetime('viewed_at').notNull().default(new Date()),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.storyId, table.guestId] }),
+}));
+
+const guestStoryViewsRelations = relations(guestStoryViews, ({ one }) => ({
+  story: one(stories, { fields: [guestStoryViews.storyId], references: [stories.id] }),
+}));
+
 module.exports = {
   users,
   usersRelations,
@@ -220,4 +337,18 @@ module.exports = {
   tasks,
   announcements,
   eventConfig,
+  stories,
+  storiesRelations,
+  storyMedia,
+  storyMediaRelations,
+  storyStats,
+  storyStatsRelations,
+  storyReactions,
+  storyReactionsRelations,
+  storyViews,
+  storyViewsRelations,
+  guestStoryReactions,
+  guestStoryReactionsRelations,
+  guestStoryViews,
+  guestStoryViewsRelations,
 };

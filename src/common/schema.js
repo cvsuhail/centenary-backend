@@ -157,9 +157,21 @@ const tasks = mysqlTable('tasks', {
   title:       varchar('title', { length: 500 }).notNull(),
   description: text('description'),
   status:      varchar('status', { length: 50 }).notNull().default('PENDING'),
+  // Task duration/deadline
+  startDate:   datetime('start_date').notNull(),
+  endDate:     datetime('end_date').notNull(),
+  // Delegation filtering (SSF, SYS, KMJ, RSC, or null for all)
+  delegation:  varchar('delegation', { length: 50 }),
+  // Visibility: tasks are NOT visible to guests by default
+  visibleToGuests: boolean('visible_to_guests').notNull().default(false),
   createdAt:   datetime('created_at').notNull().default(new Date()),
   updatedAt:   datetime('updated_at').notNull().default(new Date()),
 });
+
+const tasksRelations = relations(tasks, ({ many }) => ({
+  attachments: many(taskAttachments),
+  completions: many(taskCompletions),
+}));
 
 // ─── ANNOUNCEMENTS ──────────────────────────────────────────────────────────
 // Powers the sticky dock above the mobile bottom nav. `active` gates whether
@@ -211,7 +223,7 @@ const stories = mysqlTable('stories', {
   // Visibility: which user types can see this story
   visibleToGuests: boolean('visible_to_guests').notNull().default(true),
   visibleToDelegates: boolean('visible_to_delegates').notNull().default(true),
-  // Special delegation filtering (SSF, SYS, SKSSF, KMJ, RSC, or null for all)
+  // Special delegation filtering (SSF, SYS, KMJ, RSC, or null for all)
   specialDelegation: varchar('special_delegation', { length: 50 }),
   // Story expiration (24 hours by default like Instagram)
   expiresAt:       datetime('expires_at').notNull(),
@@ -254,6 +266,34 @@ const storyStats = mysqlTable('story_stats', {
 
 const storyStatsRelations = relations(storyStats, ({ one }) => ({
   story: one(stories, { fields: [storyStats.storyId], references: [stories.id] }),
+}));
+
+// ─── TASK ATTACHMENTS ───────────────────────────────────────────────────────
+// Files attached to tasks (image, video, audio, docs)
+const taskAttachments = mysqlTable('task_attachments', {
+  id:       int('id').primaryKey().autoincrement(),
+  taskId:   int('task_id').notNull(),
+  url:      varchar('url', { length: 1000 }),
+  type:     varchar('type', { length: 50 }).notNull(), // 'image', 'video', 'audio', 'document'
+  fileName: varchar('file_name', { length: 255 }).notNull(),
+  orderIndex: int('order_index').notNull().default(0),
+});
+
+const taskAttachmentsRelations = relations(taskAttachments, ({ one }) => ({
+  task: one(tasks, { fields: [taskAttachments.taskId], references: [tasks.id] }),
+}));
+
+// ─── TASK COMPLETIONS ───────────────────────────────────────────────────────
+// Track which users have completed which tasks
+const taskCompletions = mysqlTable('task_completions', {
+  id:        int('id').primaryKey().autoincrement(),
+  taskId:    int('task_id').notNull(),
+  userId:    int('user_id').notNull(),
+  completedAt: datetime('completed_at').notNull().default(new Date()),
+});
+
+const taskCompletionsRelations = relations(taskCompletions, ({ one }) => ({
+  task: one(tasks, { fields: [taskCompletions.taskId], references: [tasks.id] }),
 }));
 
 // ─── STORY REACTIONS ─────────────────────────────────────────────────────────
@@ -335,6 +375,11 @@ module.exports = {
   guestViews,
   guestViewsRelations,
   tasks,
+  tasksRelations,
+  taskAttachments,
+  taskAttachmentsRelations,
+  taskCompletions,
+  taskCompletionsRelations,
   announcements,
   eventConfig,
   stories,

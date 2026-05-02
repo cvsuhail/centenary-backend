@@ -15,7 +15,7 @@ const REACTION_TO_FIELD = {
   APPRECIATE: 'appreciateCount',
 };
 
-const DELEGATIONS = ['all', 'SSF', 'SYS', 'SKSSF', 'KMJ', 'RSC'];
+const DELEGATIONS = ['all', 'SSF', 'SYS', 'KMJ', 'RSC'];
 
 // Bumps `posts.updatedAt` so the client-side lastSyncedAt / If-Modified-Since
 // flow knows the row has new counters to pull. We use NOW() to avoid clock

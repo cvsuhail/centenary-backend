@@ -50,6 +50,20 @@
       "when": 1776606267693,
       "tag": "0006_moaning_strong_guy",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1776682203772,
+      "tag": "0007_icy_human_torch",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1776683323275,
+      "tag": "0008_happy_thunderbird",
+      "breakpoints": true
     }
   ]
 }

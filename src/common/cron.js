@@ -5,7 +5,7 @@ const db = require('./db');
 const { posts } = require('./schema');
 
 // Delegations for cache refresh
-const DELEGATIONS = ['all', 'SSF', 'SYS', 'SKSSF', 'KMJ', 'RSC'];
+const DELEGATIONS = ['all', 'SSF', 'SYS', 'KMJ', 'RSC'];
 
 const initCrons = () => {
   // EVERY 5 MIN: Refresh home feed cache and update lastUpdated timestamp

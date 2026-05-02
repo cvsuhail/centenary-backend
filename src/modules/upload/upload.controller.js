@@ -1,5 +1,25 @@
 const { presignUpload } = require('../../common/r2');
 const { success, error } = require('../../common/response');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, '../../../public/uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ storage });
 
 // POST /api/uploads/presign
 // Body: { fileName, contentType, kind }
@@ -36,4 +56,22 @@ const presign = async (req, res) => {
   }
 };
 
-module.exports = { presign };
+// POST /api/upload
+// Direct file upload for admin panel
+// Body: multipart/form-data with 'file' field
+// Returns: { url }
+const uploadFile = async (req, res) => {
+  try {
+    if (!req.file) {
+      return error(res, 'No file uploaded', 400);
+    }
+
+    const url = `/uploads/${req.file.filename}`;
+    return success(res, { url }, 'File uploaded successfully');
+  } catch (err) {
+    console.error('[Upload][uploadFile] Error:', err);
+    return error(res, 'Failed to upload file', 500);
+  }
+};
+
+module.exports = { presign, uploadFile, upload };

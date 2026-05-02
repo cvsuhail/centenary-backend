@@ -8,4 +8,7 @@ const authMiddleware = require('../../middlewares/auth.middleware');
 // JWT it should still pass through this middleware.
 router.post('/presign', authMiddleware, uploadController.presign);
 
+// Direct file upload for admin panel
+router.post('/', authMiddleware, uploadController.upload.single('file'), uploadController.uploadFile);
+
 module.exports = router;

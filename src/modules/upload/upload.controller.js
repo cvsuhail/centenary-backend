@@ -58,7 +58,7 @@ const presign = async (req, res) => {
 
 // POST /api/upload
 // Direct file upload for admin panel
-// Body: multipart/form-data with 'file' field
+// Body: multipart/form-data with 'file' field and optional 'kind'
 // Returns: { url }
 const uploadFile = async (req, res) => {
   try {
@@ -66,11 +66,39 @@ const uploadFile = async (req, res) => {
       return error(res, 'No file uploaded', 400);
     }
 
-    const url = `/uploads/${req.file.filename}`;
-    return success(res, { url }, 'File uploaded successfully');
+    const { kind } = req.body || {};
+    const resolvedKind = kind || 'doc';
+
+    // Get presigned URL from R2
+    const { uploadUrl, publicUrl } = await presignUpload({
+      fileName: req.file.originalname,
+      contentType: req.file.mimetype || 'application/octet-stream',
+      kind: resolvedKind,
+    });
+
+    // Upload the file to R2
+    const fs = require('fs');
+    const fileBuffer = fs.readFileSync(req.file.path);
+
+    const response = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': req.file.mimetype || 'application/octet-stream',
+      },
+      body: fileBuffer,
+    });
+
+    if (!response.ok) {
+      throw new Error(`R2 upload failed: ${response.status}`);
+    }
+
+    // Clean up local file
+    fs.unlinkSync(req.file.path);
+
+    return success(res, { url: publicUrl }, 'File uploaded successfully');
   } catch (err) {
     console.error('[Upload][uploadFile] Error:', err);
-    return error(res, 'Failed to upload file', 500);
+    return error(res, err.message || 'Failed to upload file', 500);
   }
 };
 

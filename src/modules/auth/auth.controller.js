@@ -227,7 +227,9 @@ const adminLogin = async (req, res) => {
     }
 
     // Check admin credentials
-    if (email === 'ssfitdev@gmail.com' && password === '1234') {
+    const adminEmail = process.env.ADMIN_EMAIL || 'ssfitdev@gmail.com';
+    const adminPassword = process.env.ADMIN_PASSWORD || '1234';
+    if (email === adminEmail && password === adminPassword) {
       // Generate admin token
       const token = jwt.sign(
         { 
